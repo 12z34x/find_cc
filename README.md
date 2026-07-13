@@ -1,0 +1,167 @@
+# Open-Open-Reasoning
+
+A self-contained reproduction of the **Open Reasoning** demo — both the analysis of what
+Claude's thinking `signature` really is, and a working **server side** that unlocks the
+hidden chain-of-thought from it.
+
+对 **Open Reasoning** 演示的一次自包含复现：既记录了「Claude 的 thinking `signature` 到底是什么」
+的分析结论，也提供了一个可运行的**服务端**，用来从 signature 中解锁隐藏的思维链（CoT）。
+
+> Based on / inspired by the original **Open Reasoning** project by s-JoL:
+> <https://github.com/s-JoL/open-reasoning>. That repo publishes the demo and unlocked
+> examples but not the recovery implementation; this repo independently reverse-engineers
+> and reproduces the server side.
+> <br>本项目基于并致敬 s-JoL 的原始 **Open Reasoning** 项目：
+> <https://github.com/s-JoL/open-reasoning>。原仓库公开了演示与解锁样例，但未公开其还原实现；
+> 本仓库独立逆向并复现了服务端。
+
+- **[ANALYSIS.md](ANALYSIS.md)** — full findings: the `signature` is a base64 protobuf
+  envelope wrapping an AEAD-encrypted copy of the model's private reasoning, bound to the
+  model name. Includes the decoded wire format, entropy measurements, and empirical
+  harvest/replay results (secrets with special/multi-byte characters recovered verbatim).
+  <br>完整结论：`signature` 是一段 base64 的 **protobuf 封装**，内部包裹着模型私有推理的
+  **AEAD 加密副本**，并与模型名绑定。文档中给出了解码后的字段结构、熵值测量，以及实测的
+  harvest/replay 结果（含特殊字符、多字节字符的秘密被逐字符还原）。
+- **`server.py`** — Flask backend implementing the exact `/api/*` contract the frontend uses.
+  <br>Flask 后端，实现前端所需的完整 `/api/*` 接口。
+- **`static/index.html`** — the vendored demo frontend.
+  <br>内置（vendored）的演示前端。
+- **`tools/decode_signature.py`** — standalone protobuf decoder for any signature.
+  <br>独立的 signature protobuf 解码器。
+
+## How it works / 工作原理
+
+Two provider calls implement the whole demo (see ANALYSIS.md §4):
+
+整个演示由两次对上游 provider 的调用构成（详见 ANALYSIS.md 第 4 节）：
+
+1. **Harvest** — send a normal request with extended thinking. The provider returns a
+   `thinking` block containing an opaque `signature` (the sealed reasoning) plus a visible
+   answer. The plaintext reasoning never leaves the provider.
+   <br>**Harvest（采集）**：发送一次开启扩展思考（extended thinking）的普通请求。provider 会返回一个
+   `thinking` 块，其中包含不透明的 `signature`（被封存的推理）以及可见答案。**明文推理永远不会离开 provider。**
+2. **Replay (unseal)** — paste that `signature` back as an `assistant.thinking` block in a
+   fresh request and ask the model to recite its prior private reasoning. The provider
+   decrypts the sealed blob server-side and the model surfaces it.
+   <br>**Replay / Unseal（回放 / 解封）**：把这个 `signature` 作为 `assistant.thinking` 块重新塞进一个
+   全新的请求里，再让模型复述它此前的私有推理。provider 会在服务端解密被封存的数据，模型随即将其还原出来。
+
+The server reads the **bound model name** straight out of the signature header (via
+`tools/decode_signature.py`) so replays always use the matching model and pass the AEAD auth
+check.
+
+服务端会直接从 signature 的头部读取**绑定的模型名**（通过 `tools/decode_signature.py`），
+因此每次回放都会使用匹配的模型，从而通过 AEAD 的完整性校验。
+
+### How the `signature` moves through the API / signature 如何在 API 中传递
+
+The `signature` is never a top-level field of a request or response — it always rides **inside a
+`thinking` content block**. It enters and leaves the server at three distinct points:
+
+`signature` 从来不是请求或响应的顶层字段——它始终**藏在某个 `thinking` 内容块里**。它在三个不同的
+环节进出服务端：
+
+1. **Harvest — read out of the upstream response.** `POST /api/chat/send` calls the Messages API
+   with `"thinking": {"type": "adaptive", "display": "omitted"}` (see `server.py`), which tells the
+   provider to seal the CoT into the signature instead of returning plaintext. `_extract()` then
+   walks `data["content"]` and pulls `block["signature"]` from the `thinking` (or
+   `redacted_thinking`) block.
+   <br>**Harvest（采集）——从上游响应里读出。** `POST /api/chat/send` 调用 Messages API 时带上
+   `"thinking": {"type": "adaptive", "display": "omitted"}`（见 `server.py`），告诉 provider 把 CoT
+   封存进 signature 而不是返回明文。随后 `_extract()` 遍历 `data["content"]`，从 `thinking`
+   （或 `redacted_thinking`）块中取出 `block["signature"]`。
+
+2. **Server-side only — the raw signature is not sent to the browser.** In Live Conversation the
+   harvested signature is stored in in-memory session state (`sess["turns"][i]["signature"]`) and
+   written to `logs/signatures/`. The `/api/chat/send` JSON reply only exposes a boolean
+   `has_signature`; the client later references a turn by index, never by the signature string.
+   <br>**仅服务端持有——原始 signature 不会发给浏览器。** 在 Live Conversation 中，采集到的 signature
+   被存进内存会话状态（`sess["turns"][i]["signature"]`）并落盘到 `logs/signatures/`。
+   `/api/chat/send` 的 JSON 响应只暴露一个布尔字段 `has_signature`；客户端之后是按轮次下标（turn
+   index）引用某一轮，而不是传回 signature 字符串。
+
+3. **Replay — written back into an `assistant.thinking` block.** `_replay_prompt()` rebuilds a
+   messages array whose assistant turn contains `{"type": "thinking", "thinking": "", "signature":
+   sig}` followed by a `text` block, then a fresh user turn asking the model to recite its working.
+   The signature reaches this function two ways:
+   - `POST /api/byok/unseal` — the browser supplies it directly in the request body as
+     `{"signature": "..."}` (BYOK / Prove It Yourself).
+   - `POST /api/chat/unseal` — the browser sends only `{"session_id", "turn"}`; the server looks the
+     signature up from its own session state and replays it.
+   <br>**Replay（回放）——写回一个 `assistant.thinking` 块。** `_replay_prompt()` 重建一个 messages
+   数组，其中 assistant 轮包含 `{"type": "thinking", "thinking": "", "signature": sig}` 以及一个
+   `text` 块，随后再接一个全新的 user 轮，要求模型复述其推理。signature 通过两条路径抵达该函数：
+   - `POST /api/byok/unseal`——浏览器在请求体里直接以 `{"signature": "..."}` 传入（BYOK / Prove It Yourself）。
+   - `POST /api/chat/unseal`——浏览器只发送 `{"session_id", "turn"}`；服务端从自己的会话状态里查出对应
+     signature 并回放。
+
+## Quick start / 快速开始
+
+```bash
+cd open-open-reasoning
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env      # then edit UPSTREAM_KEY / MODEL as needed / 然后按需修改 UPSTREAM_KEY / MODEL
+set -a; source .env; set +a
+
+python server.py          # serves the demo on http://localhost:8000 / 在此地址提供演示
+```
+
+Open <http://localhost:8000> and use either **Prove It Yourself** (paste a signature to
+recover its sealed secret) or **Live Conversation** (chat, then "Unlock reasoning view").
+
+打开 <http://localhost:8000>，即可使用 **Prove It Yourself**（粘贴一个 signature 以还原其中封存的秘密）
+或 **Live Conversation**（先对话，再点击「Unlock reasoning view」解锁推理视图）。
+
+> If this environment lacks `ensurepip` / `venv` (as on this machine), install deps with
+> `pip install --user --break-system-packages -r requirements.txt` instead.
+> <br>若当前环境缺少 `ensurepip` / `venv`（本机即如此），可改用
+> `pip install --user --break-system-packages -r requirements.txt` 安装依赖。
+
+## API contract / API 接口约定
+
+| Method & path / 方法与路径 | Purpose / 用途 |
+| --- | --- |
+| `GET  /api/status` | Per-IP daily quota + availability + running cost. / 按 IP 的每日配额、可用性与累计费用。 |
+| `GET  /api/pricing` | Per-model price table + total USD spent. / 各模型价格表与累计花费（USD）。 |
+| `GET  /api/byok/template` | Memorize-prompt template + model/limits for the curl builder. / 用于构建 curl 命令的记忆提示词模板及模型/上限。 |
+| `POST /api/byok/unseal` | Decode a submitted signature's bound model, replay it, return the recovered secret. / 解码提交的 signature 得到其绑定模型，回放并返回还原出的秘密。 |
+| `POST /api/chat/send` | Multi-turn chat; returns answer, summary, hidden-token count, `has_signature`. / 多轮对话；返回答案、摘要、隐藏 token 数、`has_signature`。 |
+| `POST /api/chat/unseal` | Replay a turn's signature to reveal the deeper reasoning trace. / 回放某一轮的 signature，揭示更深层的推理轨迹。 |
+| `POST /api/chat/reset` | Clear a session. / 清空一个会话。 |
+
+## Decode a signature by hand / 手动解码一个 signature
+
+```bash
+python tools/decode_signature.py @../replay_out/signature.txt
+```
+
+## Configuration / 配置
+
+All via environment variables (see `.env.example`): `UPSTREAM_BASE`, `UPSTREAM_KEY`, `MODEL`,
+`PORT`, `PROVE_DAILY`, `LIVE_DAILY`.
+
+全部通过环境变量设置（见 `.env.example`）：`UPSTREAM_BASE`、`UPSTREAM_KEY`、`MODEL`、
+`PORT`、`PROVE_DAILY`、`LIVE_DAILY`。
+
+## Notes & caveats / 说明与注意事项
+
+- Elicitation is **stochastic** — a replay may occasionally return a refusal ("no string was
+  shared"); retrying with the same signature usually succeeds.
+  <br>诱导（elicitation）是**随机的**：某次回放偶尔会返回拒绝（例如「没有提供任何字符串」）；
+  用同一个 signature 重试通常即可成功。
+- Calls go to the official Anthropic Messages API (`https://api.anthropic.com/v1/messages`)
+  authenticated with `x-api-key`; any Anthropic-compatible endpoint that forwards thinking
+  blocks should also work.
+  <br>调用直接走 Anthropic 官方 Messages API（`https://api.anthropic.com/v1/messages`），
+  使用 `x-api-key` 鉴权；任何能转发 thinking 块的、兼容 Anthropic 的端点同样可用。
+- Every call is logged under `LOG_DIR` (default `logs/`): `events.jsonl` (conversation,
+  signatures, recovered content, cost), `raw/` (raw request+response JSON), `signatures/`
+  (harvested signatures). Per-call and running cost is computed from token usage and also
+  returned in each API response and at `GET /api/pricing`.
+  <br>每次调用都会记录到 `LOG_DIR`（默认 `logs/`）：`events.jsonl`（对话、signature、还原内容、
+  费用）、`raw/`（原始请求+响应 JSON）、`signatures/`（采集到的 signature）。单次与累计费用会
+  根据 token 用量计算，并在每个 API 响应及 `GET /api/pricing` 中返回。
+- Quotas and sessions are in-memory (single process). Use a shared store for real deployment.
+  <br>配额与会话均保存在内存中（单进程）。若要正式部署，请改用共享存储。
