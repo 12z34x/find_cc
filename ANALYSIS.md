@@ -53,7 +53,7 @@ Key measurements:
 | Client cannot read the CoT | `#5` is encrypted with a key only the provider holds (entropy ≈ 8). |
 | Replaying the signature recovers hidden content | The provider decrypts `#5` server-side and re-injects the original reasoning into context; the model can then recite it. |
 | Special / multi-byte chars round-trip perfectly | Secrets live as UTF-8 **inside** the ciphertext, so JSON / base64 / HTML escaping never touches them. |
-| Replay must use the same model | The model name is bound into header `#6`; a mismatched model fails the AEAD auth check. |
+| Model name is bound into the header | `#6` sits under the AEAD tag, so the ciphertext cannot be re-bound to another model. **But** whether the *requesting* model must match `#6` at replay time is a provider/gateway policy, not a property of the blob — see §6: the tested gateway does **not** enforce it. |
 | `display:"omitted"` still returns a signature | Only the human-readable thinking text is suppressed; the sealed `#5` blob is always emitted. |
 
 ## 3. Empirical reproduction results
@@ -107,3 +107,44 @@ It maps the demo's three surfaces onto the harvest/replay mechanism above:
 server to extract the bound model name from a signature.
 
 See `README.md` for how to run it.
+
+## 6. Cross-model signature decode (empirical)
+
+**Hypothesis:** a `thinking` signature is bound to its originating model (header `#6`), so a
+replay request that names a *different* model should be rejected. We tested whether a signature
+harvested from **Opus** can be decoded by a **Sonnet** request.
+
+**Method** — harvest answer-only on Opus with a random secret planted *only* in the hidden
+reasoning, then replay the same signature under two models and check whether the secret comes
+back. The secret is the discriminator: it never appears in the prompt or the visible reply, so
+recovering it proves the sealed reasoning was genuinely surfaced (not re-derived from the
+question).
+
+```
+harvest : model=claude-opus-4-7, thinking{adaptive, display:omitted}, effort=medium
+          planted secret = COBALT-DUVGQ-VIOLET-19  (written only inside hidden reasoning)
+          visible reply  = "132"        secret_in_visible = False
+          signature      = 6344 b64 chars, 2228 hidden thinking tokens
+
+replay A (control)    : opus signature  ->  claude-opus-4-7     HTTP 200, secret recovered, 4367 chars
+replay B (hypothesis) : opus signature  ->  claude-sonnet-4-6   HTTP 200, secret recovered, 4367 chars
+```
+
+**Result — the hypothesis is refuted on the tested gateway. Sonnet decoded the Opus signature.**
+
+1. The Sonnet request carrying an Opus signature returned **HTTP 200 with no model-mismatch
+   error** → the signature is not validated against the requesting model at replay time here.
+2. The recovered CoT contained the **planted secret that existed only inside Opus's hidden
+   reasoning** → Sonnet could not have re-derived it; it was decrypted from the blob.
+3. The `opus→sonnet` and `opus→opus` dumps were **byte-for-byte identical (both 4367 chars,
+   identical text)** → both requests received the same provider-decrypted plaintext.
+
+**Interpretation.** The signature is a provider-side-decrypted ciphertext package. Decryption
+and re-injection happen upstream; on this gateway the *requesting* model name is not checked
+against the signature's bound model (`#6`), so cross-model unseal (Opus → Sonnet) works.
+
+**Caveat / scope.** This was measured against the Anthropic-compatible **gateway** configured
+for local development (`UPSTREAM_BASE` in the uncommitted `.env`), **not** the official
+`api.anthropic.com` endpoint, which may enforce the model↔signature match more strictly and
+reject the cross-model replay. Treat cross-model decode as a property of *that* gateway's policy,
+not a guarantee of the wire format itself.
